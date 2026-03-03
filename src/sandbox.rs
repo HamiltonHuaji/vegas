@@ -34,7 +34,11 @@ use std::process;
 /// command runs as root (uid 0) inside the sandbox, which is correct for
 /// privileged operations such as package installation.  When `Some`, the
 /// process drops to the specified uid/gid before exec.
-pub fn run(command: &[String], user_spec: Option<&str>) -> Result<()> {
+///
+/// `groups_spec` is an optional comma-separated list of numeric GIDs to set
+/// as the supplementary group list.  Only applied when `user_spec` is `Some`
+/// (i.e. when privileges are dropped).
+pub fn run(command: &[String], user_spec: Option<&str>, groups_spec: Option<&str>) -> Result<()> {
     if command.is_empty() {
         bail!("No command specified");
     }
@@ -50,6 +54,9 @@ pub fn run(command: &[String], user_spec: Option<&str>) -> Result<()> {
 
     // Parse the user spec (if any) to determine post-exec uid/gid.
     let (run_uid, run_gid) = parse_user_spec(user_spec)?;
+
+    // Parse the supplementary groups spec (if any).
+    let run_groups = parse_groups_spec(groups_spec)?;
 
     // Capture the current working directory so we can restore it inside the
     // sandbox after chroot.  Ignore errors (e.g. cwd was deleted).
@@ -86,7 +93,7 @@ pub fn run(command: &[String], user_spec: Option<&str>) -> Result<()> {
             }
 
             // Optionally drop root privileges before executing the command.
-            if let Err(e) = drop_privileges(run_uid, run_gid) {
+            if let Err(e) = drop_privileges(run_uid, run_gid, &run_groups) {
                 eprintln!("vegas: Failed to drop privileges: {e:#}");
                 process::exit(1);
             }
@@ -202,10 +209,14 @@ fn setup_sandbox(merged: &Path, upper: &Path, work: &Path) -> Result<()> {
 
 /// Drop root to the given uid/gid.  When both are uid 0 / gid 0, nothing is done
 /// (i.e. the command runs as root inside the sandbox).
-fn drop_privileges(uid: Uid, gid: Gid) -> Result<()> {
+///
+/// `supp_groups` sets the supplementary group list.  When empty and privileges
+/// are being dropped, all supplementary groups are cleared.
+fn drop_privileges(uid: Uid, gid: Gid, supp_groups: &[Gid]) -> Result<()> {
     if uid == Uid::from_raw(0) && gid == Gid::from_raw(0) {
         return Ok(()); // Keep root – useful for privileged commands.
     }
+    unistd::setgroups(supp_groups).context("setgroups failed")?;
     unistd::setgid(gid).context("setgid failed")?;
     unistd::setuid(uid).context("setuid failed")?;
     Ok(())
@@ -231,6 +242,25 @@ fn parse_user_spec(spec: Option<&str>) -> Result<(Uid, Gid)> {
             };
             Ok((Uid::from_raw(uid), Gid::from_raw(gid)))
         }
+    }
+}
+
+/// Parse a groups spec string of comma-separated numeric GIDs.
+///
+/// Returns an empty `Vec` when `spec` is `None` (no supplementary groups).
+fn parse_groups_spec(spec: Option<&str>) -> Result<Vec<Gid>> {
+    match spec {
+        None => Ok(Vec::new()),
+        Some(s) => s
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                part.trim()
+                    .parse::<u32>()
+                    .with_context(|| format!("Invalid gid in --groups '{s}': '{part}'"))
+                    .map(Gid::from_raw)
+            })
+            .collect(),
     }
 }
 
@@ -290,6 +320,39 @@ mod tests {
     #[test]
     fn test_parse_user_spec_invalid_gid() {
         let result = parse_user_spec(Some("1000:notanumber"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_groups_spec_none_returns_empty() {
+        let groups = parse_groups_spec(None).unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_parse_groups_spec_single() {
+        let groups = parse_groups_spec(Some("1000")).unwrap();
+        assert_eq!(groups, vec![Gid::from_raw(1000)]);
+    }
+
+    #[test]
+    fn test_parse_groups_spec_multiple() {
+        let groups = parse_groups_spec(Some("1000,1001,1002")).unwrap();
+        assert_eq!(
+            groups,
+            vec![Gid::from_raw(1000), Gid::from_raw(1001), Gid::from_raw(1002)]
+        );
+    }
+
+    #[test]
+    fn test_parse_groups_spec_with_spaces() {
+        let groups = parse_groups_spec(Some("1000, 2000")).unwrap();
+        assert_eq!(groups, vec![Gid::from_raw(1000), Gid::from_raw(2000)]);
+    }
+
+    #[test]
+    fn test_parse_groups_spec_invalid() {
+        let result = parse_groups_spec(Some("1000,notanumber"));
         assert!(result.is_err());
     }
 }

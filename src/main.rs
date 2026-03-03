@@ -41,6 +41,12 @@ enum Commands {
         #[arg(long)]
         user: Option<String>,
 
+        /// Supplementary groups to set inside the sandbox.
+        /// Accepts a comma-separated list of numeric GIDs (e.g. 1000,1001,1002).
+        /// Only effective when --user is also specified.
+        #[arg(long)]
+        groups: Option<String>,
+
         /// The command and arguments to run in the sandbox.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -50,7 +56,9 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { user, command } => sandbox::run(&command, user.as_deref())?,
+        Commands::Run { user, groups, command } => {
+            sandbox::run(&command, user.as_deref(), groups.as_deref())?
+        }
     }
     Ok(())
 }
