@@ -30,11 +30,13 @@ use std::process;
 ///
 /// Root privileges are required (e.g. `sudo vegas run -- <cmd>`).
 ///
-/// `user_spec` is an optional `uid` or `uid:gid` string.  When `None` the
-/// command runs as root (uid 0) inside the sandbox, which is correct for
-/// privileged operations such as package installation.  When `Some`, the
-/// process drops to the specified uid/gid before exec.
-pub fn run(command: &[String], user_spec: Option<&str>) -> Result<()> {
+/// `root` – when `true` the command runs as uid 0 inside the sandbox.
+///
+/// `user_spec` – an optional `uid` or `uid:gid` string.  When `None` or
+/// `Some("")` the command runs as the original calling user (taken from the
+/// `SUDO_UID`/`SUDO_GID` environment variables, or the current process
+/// uid/gid if those are not set).  Ignored when `root` is `true`.
+pub fn run(command: &[String], root: bool, user_spec: Option<&str>) -> Result<()> {
     if command.is_empty() {
         bail!("No command specified");
     }
@@ -49,7 +51,11 @@ pub fn run(command: &[String], user_spec: Option<&str>) -> Result<()> {
     }
 
     // Parse the user spec (if any) to determine post-exec uid/gid.
-    let (run_uid, run_gid) = parse_user_spec(user_spec)?;
+    let (run_uid, run_gid) = parse_user_spec(root, user_spec)?;
+
+    // Capture the current working directory so we can restore it inside the
+    // sandbox after chroot.  Ignore errors (e.g. cwd was deleted).
+    let original_cwd = std::env::current_dir().ok();
 
     // Create the temporary directory structure for overlayfs.
     let tmp = tempfile::Builder::new()
@@ -79,6 +85,14 @@ pub fn run(command: &[String], user_spec: Option<&str>) -> Result<()> {
             if let Err(e) = setup_sandbox(&merged, &upper, &work) {
                 eprintln!("vegas: Failed to set up sandbox: {e:#}");
                 process::exit(1);
+            }
+
+            // Restore the caller's working directory inside the sandbox.
+            // setup_sandbox leaves us at "/" after chroot; try to switch back
+            // to the original path (which exists in the overlay lower dir).
+            if let Some(ref cwd) = original_cwd {
+                // Ignore errors: the cwd might not exist inside the sandbox.
+                let _ = unistd::chdir(cwd);
             }
 
             // Optionally drop root privileges before executing the command.
@@ -198,12 +212,44 @@ fn drop_privileges(uid: Uid, gid: Gid) -> Result<()> {
     Ok(())
 }
 
-/// Parse a user spec string of the form `uid` or `uid:gid`.
+/// Return the uid/gid of the original caller (i.e. the user who ran sudo).
 ///
-/// Returns `(Uid(0), Gid(0))` when `spec` is `None` (run as root).
-fn parse_user_spec(spec: Option<&str>) -> Result<(Uid, Gid)> {
+/// Reads `SUDO_UID` / `SUDO_GID` environment variables set by sudo itself.
+/// Falls back to the current process uid/gid when those variables are not set
+/// (e.g. when vegas is run directly as root without sudo).
+///
+/// # Security note
+/// This function must only be called after `run()` has verified that the
+/// effective uid is 0.  `SUDO_UID`/`SUDO_GID` are written by sudo, not
+/// inherited from the caller's environment (sudo resets the environment by
+/// default), so they reliably identify the original invoking user.
+fn calling_user() -> (Uid, Gid) {
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(Uid::from_raw)
+        .unwrap_or_else(unistd::getuid);
+    let gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(Gid::from_raw)
+        .unwrap_or_else(unistd::getgid);
+    (uid, gid)
+}
+
+/// Parse the user spec to determine the uid/gid for the sandboxed process.
+///
+/// - `root = true`: always returns `(0, 0)`.
+/// - `root = false`, `spec = None` or `spec = Some("")`: returns the calling
+///   user's uid/gid (from `SUDO_UID`/`SUDO_GID` or the current process).
+/// - `root = false`, `spec = Some("uid")` or `Some("uid:gid")`: parses and
+///   returns the specified uid/gid.
+fn parse_user_spec(root: bool, spec: Option<&str>) -> Result<(Uid, Gid)> {
+    if root {
+        return Ok((Uid::from_raw(0), Gid::from_raw(0)));
+    }
     match spec {
-        None => Ok((Uid::from_raw(0), Gid::from_raw(0))),
+        None | Some("") => Ok(calling_user()),
         Some(s) => {
             let parts: Vec<&str> = s.splitn(2, ':').collect();
             let uid: u32 = parts[0]
@@ -240,5 +286,69 @@ fn exec_command(command: &[String]) {
     match unistd::execvp(&prog, &args) {
         Ok(_) => unreachable!(),
         Err(e) => eprintln!("vegas: exec '{}' failed: {e}", command[0]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_user_spec_root_flag() {
+        let (uid, gid) = parse_user_spec(true, None).unwrap();
+        assert_eq!(uid, Uid::from_raw(0));
+        assert_eq!(gid, Gid::from_raw(0));
+    }
+
+    #[test]
+    fn test_parse_user_spec_root_flag_overrides_spec() {
+        // --root takes precedence even if a spec string is provided.
+        let (uid, gid) = parse_user_spec(true, Some("1000:1000")).unwrap();
+        assert_eq!(uid, Uid::from_raw(0));
+        assert_eq!(gid, Gid::from_raw(0));
+    }
+
+    #[test]
+    fn test_parse_user_spec_none_returns_calling_user() {
+        // No flags: should return the calling user (not necessarily root).
+        // We just check that parsing succeeds; the exact uid/gid depends on
+        // SUDO_UID/SUDO_GID env vars or the real process uid/gid.
+        let result = parse_user_spec(false, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_user_spec_empty_string_returns_calling_user() {
+        // --user (no value) maps to Some("") and should behave like None.
+        let (uid_none, gid_none) = parse_user_spec(false, None).unwrap();
+        let (uid_empty, gid_empty) = parse_user_spec(false, Some("")).unwrap();
+        assert_eq!(uid_none, uid_empty);
+        assert_eq!(gid_none, gid_empty);
+    }
+
+    #[test]
+    fn test_parse_user_spec_uid_only() {
+        let (uid, gid) = parse_user_spec(false, Some("1000")).unwrap();
+        assert_eq!(uid, Uid::from_raw(1000));
+        assert_eq!(gid, Gid::from_raw(1000)); // gid defaults to uid
+    }
+
+    #[test]
+    fn test_parse_user_spec_uid_gid() {
+        let (uid, gid) = parse_user_spec(false, Some("1000:2000")).unwrap();
+        assert_eq!(uid, Uid::from_raw(1000));
+        assert_eq!(gid, Gid::from_raw(2000));
+    }
+
+    #[test]
+    fn test_parse_user_spec_invalid_uid() {
+        let result = parse_user_spec(false, Some("notanumber"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_user_spec_invalid_gid() {
+        let result = parse_user_spec(false, Some("1000:notanumber"));
+        assert!(result.is_err());
     }
 }
