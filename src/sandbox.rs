@@ -87,18 +87,21 @@ pub fn run(command: &[String], root: bool, user_spec: Option<&str>) -> Result<()
                 process::exit(1);
             }
 
-            // Restore the caller's working directory inside the sandbox.
-            // setup_sandbox leaves us at "/" after chroot; try to switch back
-            // to the original path (which exists in the overlay lower dir).
-            if let Some(ref cwd) = original_cwd {
-                // Ignore errors: the cwd might not exist inside the sandbox.
-                let _ = unistd::chdir(cwd);
-            }
-
             // Optionally drop root privileges before executing the command.
             if let Err(e) = drop_privileges(run_uid, run_gid) {
                 eprintln!("vegas: Failed to drop privileges: {e:#}");
                 process::exit(1);
+            }
+
+            // Restore the caller's working directory inside the sandbox.
+            // Do this after dropping privileges so that access to the
+            // directory is checked as the actual running user.
+            // setup_sandbox leaves us at "/" after chroot; try to switch back
+            // to the original path (which exists in the overlay lower dir).
+            if let Some(ref cwd) = original_cwd {
+                // Ignore errors: the cwd might not exist or be accessible
+                // inside the sandbox as the unprivileged user.
+                let _ = unistd::chdir(cwd);
             }
 
             // exec — never returns on success.
@@ -207,6 +210,8 @@ fn drop_privileges(uid: Uid, gid: Gid) -> Result<()> {
     if uid == Uid::from_raw(0) && gid == Gid::from_raw(0) {
         return Ok(()); // Keep root – useful for privileged commands.
     }
+    // Clear supplementary groups so the process only belongs to `gid`.
+    unistd::setgroups(&[]).context("setgroups failed")?;
     unistd::setgid(gid).context("setgid failed")?;
     unistd::setuid(uid).context("setuid failed")?;
     Ok(())
@@ -214,16 +219,24 @@ fn drop_privileges(uid: Uid, gid: Gid) -> Result<()> {
 
 /// Return the uid/gid of the original caller (i.e. the user who ran sudo).
 ///
-/// Reads `SUDO_UID` / `SUDO_GID` environment variables set by sudo itself.
-/// Falls back to the current process uid/gid when those variables are not set
-/// (e.g. when vegas is run directly as root without sudo).
+/// When running as root (effective uid 0), this reads the `SUDO_UID` and
+/// `SUDO_GID` environment variables set by sudo itself and falls back to the
+/// current process uid/gid when those variables are not set (e.g. when vegas
+/// is run directly as root without sudo).
+///
+/// When not running as root (effective uid != 0), this function ignores
+/// `SUDO_UID` / `SUDO_GID` and simply returns the current process uid/gid.
 ///
 /// # Security note
-/// This function must only be called after `run()` has verified that the
-/// effective uid is 0.  `SUDO_UID`/`SUDO_GID` are written by sudo, not
-/// inherited from the caller's environment (sudo resets the environment by
-/// default), so they reliably identify the original invoking user.
+/// `SUDO_UID` / `SUDO_GID` are trusted only when the effective uid is 0.
+/// In that case they are written by sudo (which resets the environment by
+/// default) and thus reliably identify the original invoking user.  When the
+/// effective uid is not 0, any such variables are ignored.
 fn calling_user() -> (Uid, Gid) {
+    // Only trust SUDO_UID/SUDO_GID when running as root.
+    if unistd::geteuid() != Uid::from_raw(0) {
+        return (unistd::getuid(), unistd::getgid());
+    }
     let uid = std::env::var("SUDO_UID")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -262,6 +275,9 @@ fn parse_user_spec(root: bool, spec: Option<&str>) -> Result<(Uid, Gid)> {
             } else {
                 uid // Default gid to the same value as uid.
             };
+            if uid == 0 || gid == 0 {
+                bail!("Use --root to run as uid/gid 0 inside the sandbox");
+            }
             Ok((Uid::from_raw(uid), Gid::from_raw(gid)))
         }
     }
@@ -350,5 +366,66 @@ mod tests {
     fn test_parse_user_spec_invalid_gid() {
         let result = parse_user_spec(false, Some("1000:notanumber"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_user_spec_uid_zero_without_root_flag_errors() {
+        // --user 0 should be rejected when --root is not set.
+        let result = parse_user_spec(false, Some("0"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_user_spec_uid_zero_gid_zero_without_root_flag_errors() {
+        // --user 0:0 should be rejected when --root is not set.
+        let result = parse_user_spec(false, Some("0:0"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_user_spec_nonzero_uid_zero_gid_errors() {
+        // --user 1000:0 should be rejected when --root is not set.
+        let result = parse_user_spec(false, Some("1000:0"));
+        assert!(result.is_err());
+    }
+
+    /// Mutex to serialize tests that mutate process environment variables.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_calling_user_ignores_sudo_vars_when_not_root() {
+        // When not running as root (euid != 0), SUDO_UID/SUDO_GID must be
+        // ignored and the real process uid/gid returned instead.
+        if unistd::geteuid() == Uid::from_raw(0) {
+            // Skip this test when actually running as root.
+            return;
+        }
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // Set SUDO_UID/SUDO_GID to values that differ from the real uid/gid.
+        // Use 65534 (nobody/nogroup) as a clearly-fake value unlikely to match
+        // the test runner's real uid/gid.
+        let fake_uid: u32 = 65534;
+        let fake_gid: u32 = 65534;
+        std::env::set_var("SUDO_UID", fake_uid.to_string());
+        std::env::set_var("SUDO_GID", fake_gid.to_string());
+        let (uid, gid) = calling_user();
+        std::env::remove_var("SUDO_UID");
+        std::env::remove_var("SUDO_GID");
+        // Must return the real uid/gid, not the faked env var values.
+        assert_eq!(uid, unistd::getuid());
+        assert_eq!(gid, unistd::getgid());
+    }
+
+    #[test]
+    fn test_calling_user_fallback_when_sudo_vars_absent() {
+        // When SUDO_UID/SUDO_GID are absent, calling_user() should fall back
+        // to the current process uid/gid regardless of euid.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("SUDO_UID");
+        std::env::remove_var("SUDO_GID");
+        let (uid, gid) = calling_user();
+        // With no env vars the fallback is always the process uid/gid.
+        assert_eq!(uid, unistd::getuid());
+        assert_eq!(gid, unistd::getgid());
     }
 }
