@@ -41,6 +41,28 @@ What would you like to do with these changes?
 cargo install --path .
 ```
 
+## As a Rust library
+
+Add vegas as a dependency in your `Cargo.toml`:
+
+```toml
+[dependencies]
+vegas = { path = "../vegas" }
+```
+
+Then call the public API:
+
+```rust
+fn main() -> anyhow::Result<()> {
+  let command = vec!["bash".to_string()];
+  vegas::run(&command, None, None)?;
+  Ok(())
+}
+```
+
+The library API has the same runtime requirements as the CLI (Linux + root +
+OverlayFS support).
+
 ## Usage
 
 ```bash

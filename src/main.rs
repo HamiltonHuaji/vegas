@@ -1,10 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod apply;
-mod diff;
-mod sandbox;
-
 /// What happens in Vegas, stays in Vegas — unless you decide to bring it home.
 ///
 /// A filesystem sandboxing tool using Linux namespaces and overlayfs.
@@ -56,9 +52,11 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { user, groups, command } => {
-            sandbox::run(&command, user.as_deref(), groups.as_deref())?
-        }
+        Commands::Run {
+            user,
+            groups,
+            command,
+        } => vegas::run(&command, user.as_deref(), groups.as_deref())?,
     }
     Ok(())
 }
