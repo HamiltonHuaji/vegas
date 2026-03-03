@@ -29,6 +29,12 @@ pub struct Change {
 /// with device number 0,0.  Everything else is either a new file (added) or a
 /// file that was copied up from the lower layer before being modified.
 pub fn collect_changes(upper: &Path) -> Result<Vec<Change>> {
+    collect_changes_with_prefix(upper, Path::new("/"))
+}
+
+/// Collect all changes in `upper`, mapping them under `real_prefix` on the
+/// real filesystem (e.g. `/home`, `/mnt/data`).
+pub fn collect_changes_with_prefix(upper: &Path, real_prefix: &Path) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
 
     for entry in WalkDir::new(upper).min_depth(1) {
@@ -36,7 +42,11 @@ pub fn collect_changes(upper: &Path) -> Result<Vec<Change>> {
         let path = entry.path();
 
         let rel = path.strip_prefix(upper)?;
-        let real_path = Path::new("/").join(rel);
+        let real_path = if real_prefix == Path::new("/") {
+            Path::new("/").join(rel)
+        } else {
+            real_prefix.join(rel)
+        };
 
         let metadata = entry.metadata()?;
 
@@ -178,6 +188,19 @@ mod tests {
         let changes = collect_changes(upper.path()).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::Added);
+    }
+
+    #[test]
+    fn test_collect_with_prefix_maps_real_path() {
+        let upper = tempdir().unwrap();
+        let nested = upper.path().join("foo/bar.txt");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"hello").unwrap();
+
+        let changes = collect_changes_with_prefix(upper.path(), Path::new("/tmp/vegas-prefix-test"))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].real_path, Path::new("/tmp/vegas-prefix-test/foo/bar.txt"));
     }
 
     #[test]

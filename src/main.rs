@@ -47,6 +47,21 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+
+    /// Clean up stale vegas sandbox mount points and directories.
+    ///
+    /// This command scans `/tmp` and `/var/tmp` for `vegas-*` directories,
+    /// shows all detected mount points, and asks for confirmation before
+    /// unmounting and deleting them.
+    Cleanup {
+        /// Skip confirmation prompts.
+        #[arg(long)]
+        yes: bool,
+
+        /// Show what would be cleaned without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -57,6 +72,9 @@ fn main() -> Result<()> {
             groups,
             command,
         } => vegas::run(&command, user.as_deref(), groups.as_deref())?,
+        Commands::Cleanup { yes, dry_run } => {
+            vegas::cleanup::cleanup(vegas::cleanup::CleanupOptions { yes, dry_run })?
+        }
     }
     Ok(())
 }

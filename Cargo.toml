@@ -10,6 +10,10 @@ license = "MIT"
 name = "vegas"
 path = "src/main.rs"
 
+[[bin]]
+name = "vegas-user"
+path = "src/bin/vegas-user.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
