@@ -18,6 +18,12 @@ struct SandboxCandidate {
     mounts: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct UnmountOutcome {
+    path: PathBuf,
+    remaining_mounts: Vec<PathBuf>,
+}
+
 pub fn cleanup(options: CleanupOptions) -> Result<()> {
     if unistd::geteuid() != Uid::from_raw(0) {
         bail!("vegas cleanup requires root privileges. Try: sudo vegas cleanup");
@@ -33,26 +39,33 @@ pub fn cleanup(options: CleanupOptions) -> Result<()> {
     print_cleanup_plan(&candidates);
 
     if options.dry_run {
-        println!("Dry-run mode enabled. No changes were made.");
-        return Ok(());
+        println!("Dry-run mode enabled. Commands will be printed but not executed.");
     }
 
-    if !options.yes
-        && !confirm("Proceed with unmount + directory cleanup for all items above? [y/N]: ")?
+    if !options.dry_run
+        && !options.yes
+        && !confirm("Proceed with unmount stage for all items above? [y/N]: ")?
     {
         println!("Cleanup cancelled.");
         return Ok(());
     }
 
     let mut any_errors = false;
+    let mut outcomes = Vec::new();
+
     for candidate in &candidates {
-        println!("\nCleaning {}", candidate.path.display());
+        println!("\nUnmounting {}", candidate.path.display());
 
         let mut busy_mounts = Vec::new();
         let mut mounts = candidate.mounts.clone();
         mounts.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
 
         for mount_point in mounts {
+            if options.dry_run {
+                println!("  dry-run: umount {}", mount_point.display());
+                continue;
+            }
+
             match umount(mount_point.as_path()) {
                 Ok(_) => println!("  unmounted {}", mount_point.display()),
                 Err(Errno::EBUSY) => {
@@ -64,6 +77,11 @@ pub fn cleanup(options: CleanupOptions) -> Result<()> {
                     eprintln!("  warning: failed to unmount {}: {e}", mount_point.display());
                 }
             }
+        }
+
+        if options.dry_run {
+            println!("  dry-run: would check remaining mounts under {}", candidate.path.display());
+            continue;
         }
 
         if !busy_mounts.is_empty() {
@@ -93,11 +111,94 @@ pub fn cleanup(options: CleanupOptions) -> Result<()> {
             }
         }
 
-        if let Err(e) = fs::remove_dir_all(&candidate.path) {
-            any_errors = true;
-            eprintln!("  warning: failed to remove {}: {}", candidate.path.display(), e);
+        let remaining_mounts = current_mounts_under(&candidate.path)?;
+        if remaining_mounts.is_empty() {
+            println!("  no mount points remain under {}", candidate.path.display());
         } else {
-            println!("  removed {}", candidate.path.display());
+            any_errors = true;
+            println!(
+                "  {} mount point(s) still remain under {}",
+                remaining_mounts.len(),
+                candidate.path.display()
+            );
+            for mount in &remaining_mounts {
+                println!("    • {}", mount.display());
+            }
+        }
+
+        outcomes.push(UnmountOutcome {
+            path: candidate.path.clone(),
+            remaining_mounts,
+        });
+    }
+
+    println!("\nUnmount stage complete.");
+
+    if options.dry_run {
+        println!();
+        println!("Delete stage (dry-run):");
+        for candidate in &candidates {
+            println!("  dry-run: would delete {}", candidate.path.display());
+        }
+        println!("Dry-run mode enabled. No changes were made.");
+        return Ok(());
+    }
+
+    let mut deletable_paths = Vec::new();
+    let mut blocked_paths = Vec::new();
+    for outcome in outcomes {
+        if outcome.remaining_mounts.is_empty() {
+            deletable_paths.push(outcome.path);
+        } else {
+            blocked_paths.push(outcome);
+        }
+    }
+
+    if !blocked_paths.is_empty() {
+        println!();
+        println!(
+            "Skipping delete stage for {} sandbox(es) due to remaining mount points:",
+            blocked_paths.len()
+        );
+        for outcome in &blocked_paths {
+            println!("- {}", outcome.path.display());
+        }
+    }
+
+    if deletable_paths.is_empty() {
+        if any_errors {
+            println!("\nCleanup finished with warnings.");
+        } else {
+            println!("\nCleanup complete.");
+        }
+        return Ok(());
+    }
+
+    println!();
+    println!("Delete stage plan (already unmounted):");
+    for path in &deletable_paths {
+        println!("- {}", path.display());
+    }
+
+    if !options.yes
+        && !confirm("Proceed with directory deletion stage for the items above? [y/N]: ")?
+    {
+        println!("Delete stage cancelled. Unmount stage results were kept.");
+        if any_errors {
+            println!("\nCleanup finished with warnings.");
+        } else {
+            println!("\nCleanup complete.");
+        }
+        return Ok(());
+    }
+
+    for path in deletable_paths {
+        println!("\nDeleting {}", path.display());
+        if let Err(e) = fs::remove_dir_all(&path) {
+            any_errors = true;
+            eprintln!("  warning: failed to remove {}: {}", path.display(), e);
+        } else {
+            println!("  removed {}", path.display());
         }
     }
 
@@ -108,6 +209,16 @@ pub fn cleanup(options: CleanupOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn current_mounts_under(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut mounts: Vec<PathBuf> = read_mount_points()?
+        .into_iter()
+        .filter(|mount| mount.starts_with(path))
+        .collect();
+    mounts.sort();
+    mounts.dedup();
+    Ok(mounts)
 }
 
 fn discover_candidates() -> Result<Vec<SandboxCandidate>> {

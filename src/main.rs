@@ -51,8 +51,8 @@ enum Commands {
     /// Clean up stale vegas sandbox mount points and directories.
     ///
     /// This command scans `/tmp` and `/var/tmp` for `vegas-*` directories,
-    /// shows all detected mount points, and asks for confirmation before
-    /// unmounting and deleting them.
+    /// shows all detected mount points, and runs in two stages with separate
+    /// confirmations: unmount first, then directory deletion.
     Cleanup {
         /// Skip confirmation prompts.
         #[arg(long)]
